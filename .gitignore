@@ -3,5 +3,6 @@ node_modules/
 .env.local
 *.log
 bun.lockb
+package-lock.json
 dist/
 .DS_Store
