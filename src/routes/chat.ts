@@ -45,7 +45,7 @@
  */
 import { query } from '@anthropic-ai/claude-agent-sdk'
 import { logger } from '../log.ts'
-import { getSimMcpServer } from '../sim-tools.ts'
+import { buildSimMcpServer, type IntegrationToolDef } from '../sim-tools.ts'
 
 const DEFAULT_MODEL = process.env.MOTHERSHIP_DEFAULT_MODEL ?? 'claude-sonnet-4-6'
 const CLAUDE_BINARY_PATH =
@@ -70,7 +70,7 @@ type SimChatPayload = {
   messageId?: string
   chatId?: string
   context?: unknown
-  integrationTools?: unknown
+  integrationTools?: IntegrationToolDef[]
   workspaceContext?: { id?: string; name?: string }
   userPermission?: string
   userTimezone?: string
@@ -125,6 +125,8 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
   const streamId = payload.messageId ?? requestId
   const model = payload.model || DEFAULT_MODEL
 
+  const integrationTools = Array.isArray(payload.integrationTools) ? payload.integrationTools : []
+
   logger.info('chat request', {
     requestId,
     path,
@@ -133,6 +135,7 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
     model,
     workspaceId: payload.workspaceId,
     msgLength: message.length,
+    integrationToolCount: integrationTools.length,
   })
 
   const transcript = buildTranscript(chatId, message, payload)
@@ -171,7 +174,7 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
       let completeStatus: 'complete' | 'error' | 'cancelled' = 'complete'
 
       try {
-        const simServer = await getSimMcpServer()
+        const simServer = await buildSimMcpServer(integrationTools)
         const q = query({
           prompt: transcript,
           options: {
