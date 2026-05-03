@@ -20,6 +20,10 @@ const HOST = process.env.HOST ?? '127.0.0.1'
 const server = Bun.serve({
   port: PORT,
   hostname: HOST,
+  // Chat requests run a Claude Code subprocess and stream events back over SSE; default
+  // 10s idleTimeout truncates any long-running tool dispatch. Disable so streams can run
+  // as long as the SDK needs (per-request abort still respected via AbortController).
+  idleTimeout: 0,
   async fetch(req) {
     const url = new URL(req.url)
     const path = url.pathname

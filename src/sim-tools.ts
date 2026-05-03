@@ -120,14 +120,30 @@ function buildToolFromMcp(mcp: McpTool) {
 
 let cachedServer: ReturnType<typeof createSdkMcpServer> | null = null
 
+/**
+ * Sim's `sim_*` tools (sim_workflow, sim_auth, sim_research, sim_superagent, etc.) are
+ * subagent meta-tools, not flat primitives. When dispatched they round-trip back to
+ * mothership at /api/subagent/<id>, which we don't implement (v1.0). Filter them out so
+ * Claude only sees the direct tools.
+ */
+function isDirectTool(name: string): boolean {
+  return !name.startsWith('sim_')
+}
+
 export async function getSimMcpServer() {
   if (cachedServer) return cachedServer
-  const tools = await listSimTools()
-  logger.info('registered sim tools as sdk mcp server', { count: tools.length, names: tools.map((t) => t.name) })
+  const allTools = await listSimTools()
+  const directTools = allTools.filter((t) => isDirectTool(t.name))
+  const skipped = allTools.length - directTools.length
+  logger.info('registered sim tools as sdk mcp server', {
+    count: directTools.length,
+    skippedSubagents: skipped,
+    names: directTools.map((t) => t.name),
+  })
   cachedServer = createSdkMcpServer({
     name: 'sim',
     version: '0.0.1',
-    tools: tools.map(buildToolFromMcp),
+    tools: directTools.map(buildToolFromMcp),
   })
   return cachedServer
 }

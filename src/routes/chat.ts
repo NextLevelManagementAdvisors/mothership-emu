@@ -141,7 +141,12 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
     async start(controller) {
       const enc = new TextEncoder()
       let seq = 0
+      let streamClosed = false
+      // Guard enqueue: if the client disconnects mid-stream the controller closes, but the
+      // SDK loop keeps emitting events. Without this guard each subsequent send() throws
+      // "Invalid state: Controller is already closed" and trashes the request handler.
       const send = (type: string, payloadObj: unknown) => {
+        if (streamClosed) return
         const event = {
           v: 1,
           seq: ++seq,
@@ -151,7 +156,11 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
           type,
           payload: payloadObj,
         }
-        controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`))
+        try {
+          controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`))
+        } catch {
+          streamClosed = true
+        }
       }
 
       // Session 'start' so sim sees an immediate handshake.
@@ -195,7 +204,14 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
       }
 
       send('complete', { status: completeStatus })
-      controller.close()
+      if (!streamClosed) {
+        try {
+          controller.close()
+        } catch {
+          // already closed
+        }
+        streamClosed = true
+      }
     },
   })
 
