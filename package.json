@@ -1,0 +1,22 @@
+{
+  "name": "mothership-emu",
+  "version": "0.0.1",
+  "description": "Self-hosted replacement for sim.ai's Mothership service. Drops in as SIM_AGENT_API_URL.",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/server.ts",
+    "start": "bun src/server.ts",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}
