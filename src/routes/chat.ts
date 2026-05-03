@@ -1,30 +1,53 @@
 /**
- * The LLM brain — receives sim's chat orchestration request and streams Mothership-format
- * events back. v0.1 implementation: claude-agent-sdk + sim's MCP tool catalog.
+ * The LLM brain — receives sim's chat request and streams MothershipStreamV1 events back.
  *
- * Flow:
- *   1. Parse sim's payload (conversation, model, contexts, etc.)
- *   2. Flatten conversation into a single transcript prompt (v0.1 approach — v0.2 will use
- *      persistSession/resume so multi-turn doesn't replay tokens)
- *   3. Hand to query() with sim's MCP server registered as the tool surface
- *   4. Iterate SDK messages, translate to MothershipStreamV1 SSE events
+ * Wire contract (reverse-engineered from sim's source — see notes below):
  *
- * Stub paths (still v0.0.1 behavior — not the focus of v0.1):
- *   - /api/subagent/<id>     : returns "not implemented" — direct tools cover most workflows
- *   - /api/mothership/execute: returns 501 — non-streaming variant, niche
- *   - /api/tools/resume      : returns "not implemented" — checkpoint/resume is v0.3
+ * **Request from sim**: POST /api/copilot or /api/mothership with body:
+ *   {
+ *     message: string,                    // the new user message
+ *     workspaceId?, workflowId?, userId,
+ *     mode: 'agent' | 'ask',
+ *     model?, provider?,
+ *     messageId: string,                  // sim uses this as the streamId
+ *     chatId?: string,                    // we key history by this
+ *     context?: Array<{type, content}>,
+ *     integrationTools?: Array<{...}>,    // tool catalog from sim's side
+ *     workspaceContext?, userPermission?, userTimezone?,
+ *     isHosted: boolean,
+ *   }
+ *   Note: sim does NOT send conversation history. Mothership maintains state per chatId.
+ *
+ * **Response to sim**: SSE stream of envelope-wrapped events. Each event MUST have:
+ *   {
+ *     v: 1,
+ *     seq: <incrementing number>,
+ *     ts: <ISO timestamp>,
+ *     stream: { streamId, chatId?, cursor? },
+ *     trace?: { requestId },
+ *     type: 'session' | 'text' | 'tool' | 'complete' | 'error',
+ *     payload: <type-specific shape — see MothershipStreamV1*Payload>,
+ *   }
+ *   Sim's parsePersistedStreamEventEnvelope strictly validates this shell. Without v=1 + seq
+ *   + ts + stream.streamId, the event is rejected with "unexpected v=undefined".
+ *
+ * **Payload shapes**:
+ *   - text:    { channel: 'assistant'|'thinking', text }     (note: `text`, NOT `content`)
+ *   - tool call: { phase: 'call', toolCallId, toolName, executor: 'sim', mode: 'sync', arguments? }
+ *   - tool result: { phase: 'result', toolCallId, toolName, executor: 'sim', mode: 'sync',
+ *                    success: bool, output?, error? }
+ *   - complete: { status: 'complete' | 'error' | 'cancelled' }
+ *   - error:   { message: string, error?, displayMessage? }
+ *
+ * History strategy (v0.1.1): in-memory Map<chatId, Array<{role, content}>>. The history is
+ * rebuilt into a single transcript prompt on each request. v0.2 will switch to SDK
+ * persistSession+resume keyed by chatId so we don't re-tokenize history every turn.
  */
 import { query } from '@anthropic-ai/claude-agent-sdk'
 import { logger } from '../log.ts'
 import { getSimMcpServer } from '../sim-tools.ts'
 
 const DEFAULT_MODEL = process.env.MOTHERSHIP_DEFAULT_MODEL ?? 'claude-sonnet-4-6'
-/**
- * Path to the Claude Code native binary the SDK should spawn. The SDK's auto-detect
- * tries the musl variant first on linux, which fails on glibc images (debian, ubuntu).
- * We default to the glibc-compatible variant shipped with the SDK; override via env if
- * deploying to alpine/musl.
- */
 const CLAUDE_BINARY_PATH =
   process.env.CLAUDE_CODE_BINARY ??
   '/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude'
@@ -35,26 +58,36 @@ You help users build, debug, and operate workflows using the sim_* tools availab
 When a user asks for something, prefer using tools to inspect or modify their actual workflows
 rather than answering hypothetically. Always confirm destructive actions before taking them.`
 
-type SimMessage = {
-  role: 'user' | 'assistant' | 'tool' | 'system'
-  content?: string
-  toolCalls?: Array<{ name: string; args: unknown; id?: string }>
-  toolCallId?: string
-  result?: unknown
-}
-
 type SimChatPayload = {
-  conversation?: SimMessage[]
-  contexts?: unknown[]
-  fileAttachments?: unknown[]
+  message?: string
+  workspaceId?: string
+  workflowId?: string
+  workflowName?: string
+  userId?: string
+  model?: string
+  provider?: string
+  mode?: string
+  messageId?: string
+  chatId?: string
+  context?: unknown
+  integrationTools?: unknown
   workspaceContext?: { id?: string; name?: string }
   userPermission?: string
   userTimezone?: string
-  model?: string
-  messageId?: string
-  chatId?: string
-  executionId?: string
-  runId?: string
+  isHosted?: boolean
+}
+
+type ChatTurn = { role: 'user' | 'assistant'; content: string }
+
+const chatHistory = new Map<string, ChatTurn[]>()
+const HISTORY_MAX_TURNS = 40
+
+function rememberTurn(chatId: string | undefined, turn: ChatTurn) {
+  if (!chatId) return
+  const prior = chatHistory.get(chatId) ?? []
+  prior.push(turn)
+  while (prior.length > HISTORY_MAX_TURNS) prior.shift()
+  chatHistory.set(chatId, prior)
 }
 
 export async function handleChatRoute(req: Request, path: string, requestId: string): Promise<Response> {
@@ -64,11 +97,7 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
 
   if (path.startsWith('/api/subagent/')) {
     logger.warn('subagent endpoint not implemented', { requestId, path })
-    return sseStub(
-      'mothership-emu v0.1 does not implement subagents (sim_workflow, sim_research, etc.). ' +
-        'Use the direct tools instead — Claude can compose them to do anything subagents do.',
-      requestId,
-    )
+    return sseStub('mothership-emu v0.1 does not implement subagents (sim_workflow, sim_research, etc.).', requestId)
   }
 
   if (path === '/api/mothership/execute') {
@@ -91,25 +120,46 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
     return Response.json({ error: 'invalid json' }, { status: 400 })
   }
 
+  const message = (payload.message ?? '').trim()
+  const chatId = payload.chatId
+  const streamId = payload.messageId ?? requestId
+  const model = payload.model || DEFAULT_MODEL
+
   logger.info('chat request', {
     requestId,
     path,
-    chatId: payload.chatId,
-    model: payload.model ?? DEFAULT_MODEL,
-    turns: payload.conversation?.length ?? 0,
+    chatId,
+    streamId,
+    model,
+    workspaceId: payload.workspaceId,
+    msgLength: message.length,
   })
 
-  const transcript = flattenConversation(payload)
-  const model = payload.model ?? DEFAULT_MODEL
+  const transcript = buildTranscript(chatId, message, payload)
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const enc = new TextEncoder()
-      const send = (event: { type: string; payload: unknown }) => {
+      let seq = 0
+      const send = (type: string, payloadObj: unknown) => {
+        const event = {
+          v: 1,
+          seq: ++seq,
+          ts: new Date().toISOString(),
+          stream: { streamId, ...(chatId ? { chatId } : {}), cursor: String(seq) },
+          trace: { requestId },
+          type,
+          payload: payloadObj,
+        }
         controller.enqueue(enc.encode(`data: ${JSON.stringify(event)}\n\n`))
       }
 
-      send({ type: 'session', payload: { id: requestId, model } })
+      // Session 'start' so sim sees an immediate handshake.
+      send('session', { kind: 'start' })
+      if (chatId) send('session', { kind: 'chat', chatId })
+
+      let assistantText = ''
+      let completeStatus: 'complete' | 'error' | 'cancelled' = 'complete'
 
       try {
         const simServer = await getSimMcpServer()
@@ -119,15 +169,8 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
             model,
             systemPrompt: DEFAULT_SYSTEM_PROMPT,
             pathToClaudeCodeExecutable: CLAUDE_BINARY_PATH,
-            // createSdkMcpServer already returns { type: 'sdk', name, instance }, so pass it through directly.
             mcpServers: { sim: simServer },
-            // Disable built-in Claude Code tools (Bash, Read, Write, Grep, ToolSearch, etc.)
-            // Only sim's MCP tools should be available inside the brain.
             tools: [],
-            // Headless server: auto-approve every tool call via canUseTool callback.
-            // Sim is the trust boundary — it owns auth on /api/mcp/copilot and decides
-            // what each workspace key can do. We can't use --dangerously-skip-permissions
-            // because Claude Code refuses that flag when running as root in a container.
             canUseTool: async (toolName, input) => {
               logger.info('auto-approving tool', { tool: toolName })
               return { behavior: 'allow', updatedInput: input }
@@ -137,18 +180,22 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
         })
 
         for await (const msg of q) {
-          translateSdkMessage(msg as SdkMessageLike, send)
+          assistantText += translateSdkMessage(msg as SdkMessageLike, send)
         }
-
-        send({ type: 'complete', payload: {} })
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         logger.error('chat brain crashed', { requestId, error: message })
-        send({ type: 'error', payload: { message } })
-        send({ type: 'complete', payload: {} })
-      } finally {
-        controller.close()
+        send('error', { message, displayMessage: 'Mothership-emu encountered an error.' })
+        completeStatus = 'error'
       }
+
+      if (assistantText && chatId) {
+        rememberTurn(chatId, { role: 'user', content: message })
+        rememberTurn(chatId, { role: 'assistant', content: assistantText })
+      }
+
+      send('complete', { status: completeStatus })
+      controller.close()
     },
   })
 
@@ -164,74 +211,30 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
 }
 
 /**
- * Flatten sim's conversation array into a single transcript prompt. v0.1 trade-off:
- * we replay the full history on every turn instead of using SDK session persistence.
- * Costs more tokens but is stateless and matches sim's own request shape, so we don't
- * have to maintain a chatId→sessionId map yet.
+ * Replay prior turns + the new user message into a single transcript prompt. v0.1.1
+ * trade-off: re-tokenizes history each turn. v0.2 will use SDK persistSession+resume
+ * so this becomes unnecessary.
  */
-function flattenConversation(payload: SimChatPayload): string {
+function buildTranscript(chatId: string | undefined, message: string, payload: SimChatPayload): string {
   const parts: string[] = []
-
   if (payload.workspaceContext?.name) {
     parts.push(`# Workspace: ${payload.workspaceContext.name} (id: ${payload.workspaceContext.id ?? 'unknown'})`)
   }
-  if (payload.userTimezone) {
-    parts.push(`User timezone: ${payload.userTimezone}`)
-  }
-  if (payload.contexts && payload.contexts.length > 0) {
-    parts.push(`Attached contexts: ${JSON.stringify(payload.contexts)}`)
-  }
+  if (payload.userTimezone) parts.push(`User timezone: ${payload.userTimezone}`)
 
-  const conv = payload.conversation ?? []
-  // The user's latest message is always the last user-role turn — extract it as the
-  // "current ask" so Claude doesn't think prior turns are still pending.
-  let lastUserIdx = -1
-  for (let i = conv.length - 1; i >= 0; i--) {
-    if (conv[i]?.role === 'user') {
-      lastUserIdx = i
-      break
-    }
-  }
-
-  if (lastUserIdx > 0) {
+  const prior = chatId ? chatHistory.get(chatId) : undefined
+  if (prior && prior.length > 0) {
     parts.push('## Prior conversation')
-    for (let i = 0; i < lastUserIdx; i++) {
-      const turn = conv[i]
-      if (turn) parts.push(formatTurn(turn))
+    for (const turn of prior) {
+      parts.push(`${turn.role === 'user' ? 'User' : 'Assistant'}: ${turn.content}`)
     }
     parts.push('## Current request')
-    const current = conv[lastUserIdx]
-    if (current) parts.push(formatTurn(current))
-  } else if (lastUserIdx === 0) {
-    const turn = conv[0]
-    if (turn) parts.push(formatTurn(turn))
-  } else {
-    parts.push('(no user message in conversation)')
   }
 
+  parts.push(message || '(empty message)')
   return parts.join('\n\n')
 }
 
-function formatTurn(turn: SimMessage): string {
-  if (turn.role === 'tool') {
-    return `[tool result for ${turn.toolCallId ?? '?'}]: ${JSON.stringify(turn.result ?? null)}`
-  }
-  const tag = turn.role === 'user' ? 'User' : turn.role === 'assistant' ? 'Assistant' : 'System'
-  let body = turn.content ?? ''
-  if (turn.toolCalls && turn.toolCalls.length > 0) {
-    body += `\n[tool calls: ${turn.toolCalls.map((t) => t.name).join(', ')}]`
-  }
-  return `${tag}: ${body}`
-}
-
-/**
- * Map a single SDK message into one or more MothershipStreamV1 events.
- *
- * SDK SDKAssistantMessage.message is the Anthropic Beta Message — a content array of
- * text/tool_use blocks. We split text vs tool_use and emit accordingly. SDKResultMessage
- * carries usage/cost; we surface those on `complete` rather than emitting a separate event,
- * because sim already has its own complete handler.
- */
 type SdkMessageLike = {
   type?: string
   message?: { content?: unknown }
@@ -240,68 +243,91 @@ type SdkMessageLike = {
   subtype?: string
 }
 
-function translateSdkMessage(
-  msg: SdkMessageLike,
-  send: (event: { type: string; payload: unknown }) => void,
-) {
+/**
+ * Translate one SDK message into MothershipStreamV1 events. Returns the assistant text
+ * portion (so the caller can persist it for history rebuilding next turn).
+ */
+function translateSdkMessage(msg: SdkMessageLike, send: (type: string, payload: unknown) => void): string {
+  let assistantText = ''
+
   if (msg.type === 'assistant' && Array.isArray(msg.message?.content)) {
-    for (const block of msg.message.content as Array<{ type: string; text?: string; name?: string; input?: unknown; thinking?: string; id?: string }>) {
+    for (const block of msg.message.content as Array<{
+      type: string
+      text?: string
+      name?: string
+      input?: unknown
+      thinking?: string
+      id?: string
+    }>) {
       if (block.type === 'text' && block.text) {
-        send({ type: 'text', payload: { channel: 'assistant', content: block.text } })
+        send('text', { channel: 'assistant', text: block.text })
+        assistantText += block.text
       } else if (block.type === 'thinking' && block.thinking) {
-        send({ type: 'text', payload: { channel: 'thinking', content: block.thinking } })
-      } else if (block.type === 'tool_use') {
-        send({
-          type: 'tool',
-          payload: {
-            executor: 'sim',
-            mode: 'sync',
-            name: block.name,
-            args: block.input,
-            id: block.id,
-          },
+        send('text', { channel: 'thinking', text: block.thinking })
+      } else if (block.type === 'tool_use' && block.id && block.name) {
+        send('tool', {
+          phase: 'call',
+          toolCallId: block.id,
+          toolName: block.name,
+          executor: 'sim',
+          mode: 'sync',
+          arguments: (block.input ?? {}) as Record<string, unknown>,
         })
       }
     }
-    return
+    return assistantText
   }
 
   if (msg.type === 'user' && Array.isArray(msg.message?.content)) {
-    // Tool results from the SDK side — emit so sim can render the outcome inline.
-    for (const block of msg.message.content as Array<{ type: string; tool_use_id?: string; content?: unknown; is_error?: boolean }>) {
-      if (block.type === 'tool_result') {
-        send({
-          type: 'tool',
-          payload: {
-            executor: 'sim',
-            mode: 'sync',
-            outcome: block.is_error ? 'error' : 'success',
-            id: block.tool_use_id,
-            result: block.content,
-          },
+    for (const block of msg.message.content as Array<{
+      type: string
+      tool_use_id?: string
+      content?: unknown
+      is_error?: boolean
+    }>) {
+      if (block.type === 'tool_result' && block.tool_use_id) {
+        send('tool', {
+          phase: 'result',
+          toolCallId: block.tool_use_id,
+          toolName: '',
+          executor: 'sim',
+          mode: 'sync',
+          success: !block.is_error,
+          output: block.content,
+          ...(block.is_error ? { error: 'Tool execution failed' } : {}),
         })
       }
     }
-    return
+    return ''
   }
 
   if (msg.type === 'result') {
-    // Surface cost/usage on a final text in case the panel renders it; keep it small.
     if (typeof msg.total_cost_usd === 'number') {
       logger.info('chat complete', { cost: msg.total_cost_usd, usage: msg.usage })
     }
-    return
+    return ''
   }
+
+  return ''
 }
 
 function sseStub(message: string, requestId: string): Response {
   const enc = new TextEncoder()
-  const events = [
-    { type: 'session', payload: { id: requestId } },
-    { type: 'error', payload: { message } },
-    { type: 'complete', payload: {} },
-  ]
-  const body = events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('')
+  let seq = 0
+  const wrap = (type: string, payload: unknown) =>
+    `data: ${JSON.stringify({
+      v: 1,
+      seq: ++seq,
+      ts: new Date().toISOString(),
+      stream: { streamId: requestId, cursor: String(seq) },
+      trace: { requestId },
+      type,
+      payload,
+    })}\n\n`
+  const body =
+    wrap('session', { kind: 'start' }) +
+    wrap('error', { message, displayMessage: message }) +
+    wrap('complete', { status: 'error' })
   return new Response(enc.encode(body), {
     status: 200,
     headers: {
