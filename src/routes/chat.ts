@@ -19,6 +19,15 @@ import { logger } from '../log.ts'
 import { getSimMcpServer } from '../sim-tools.ts'
 
 const DEFAULT_MODEL = process.env.MOTHERSHIP_DEFAULT_MODEL ?? 'claude-sonnet-4-6'
+/**
+ * Path to the Claude Code native binary the SDK should spawn. The SDK's auto-detect
+ * tries the musl variant first on linux, which fails on glibc images (debian, ubuntu).
+ * We default to the glibc-compatible variant shipped with the SDK; override via env if
+ * deploying to alpine/musl.
+ */
+const CLAUDE_BINARY_PATH =
+  process.env.CLAUDE_CODE_BINARY ??
+  '/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude'
 const DEFAULT_SYSTEM_PROMPT =
   process.env.MOTHERSHIP_SYSTEM_PROMPT ??
   `You are Sim Copilot, an AI assistant embedded in the Sim workflow automation platform.
@@ -109,10 +118,20 @@ export async function handleChatRoute(req: Request, path: string, requestId: str
           options: {
             model,
             systemPrompt: DEFAULT_SYSTEM_PROMPT,
+            pathToClaudeCodeExecutable: CLAUDE_BINARY_PATH,
             // createSdkMcpServer already returns { type: 'sdk', name, instance }, so pass it through directly.
             mcpServers: { sim: simServer },
-            // Deny everything except the sim tools — no Bash/Read/Write inside the brain.
-            allowedTools: [],
+            // Disable built-in Claude Code tools (Bash, Read, Write, Grep, ToolSearch, etc.)
+            // Only sim's MCP tools should be available inside the brain.
+            tools: [],
+            // Headless server: auto-approve every tool call via canUseTool callback.
+            // Sim is the trust boundary — it owns auth on /api/mcp/copilot and decides
+            // what each workspace key can do. We can't use --dangerously-skip-permissions
+            // because Claude Code refuses that flag when running as root in a container.
+            canUseTool: async (toolName, input) => {
+              logger.info('auto-approving tool', { tool: toolName })
+              return { behavior: 'allow', updatedInput: input }
+            },
             includePartialMessages: false,
           },
         })
