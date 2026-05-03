@@ -189,33 +189,84 @@ async function getCachedManagementTools(): Promise<McpTool[]> {
 }
 
 /**
+ * Hard cap on how many integration tools we'll register per request. Sim's
+ * buildIntegrationToolSchemas returns the FULL catalog (~2500+ tools across every
+ * integration block) because the hosted Mothership uses lazy `defer_loading: true`
+ * to fetch tool defs on demand. We don't have that infrastructure (yet), so we cap
+ * the catalog and prioritize the tools most likely to be useful. Override via env.
+ */
+const MAX_INTEGRATION_TOOLS = Number(process.env.MOTHERSHIP_MAX_INTEGRATION_TOOLS ?? 100)
+
+/**
+ * Prefix priority for the cap: when sim hands us more integration tools than we can
+ * fit, we keep these prefixes first (commonly-needed integrations), then fill the
+ * rest with whatever else fits. Override via env (comma-separated prefix list).
+ */
+const PRIORITY_PREFIXES = (
+  process.env.MOTHERSHIP_PRIORITY_INTEGRATIONS ??
+  'gmail_,googlecalendar_,googledrive_,googledocs_,googlesheets_,slack_,twilio_,notion_,airtable_,hubspot_,salesforce_,linear_,asana_,jira_,github_,discord_,openai_,anthropic_,perplexity_,exa_,firecrawl_,serper_,reddit_,outlook_,microsoftteams_,teams_,confluence_,clickup_,trello_,zendesk_,intercom_,hospitable_,guesty_,airbnb_,stripe_'
+)
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+
+function integrationPriority(name: string): number {
+  // Lower = more important. Tools without an OAuth requirement, then matching priority
+  // prefixes in declared order, then alphabetical.
+  for (let i = 0; i < PRIORITY_PREFIXES.length; i++) {
+    if (PRIORITY_PREFIXES[i] && name.startsWith(PRIORITY_PREFIXES[i] as string)) return i
+  }
+  return PRIORITY_PREFIXES.length // unmatched falls to end
+}
+
+/**
  * Build a fresh SDK MCP server for one chat request, combining the cached management
  * tools with the per-request integration tools sim included in its payload. Returning a
  * new server per call avoids the lifecycle/transport state-sharing concerns that come
  * with reusing a single McpServer instance across concurrent SDK queries.
  *
- * If sim sent no integrationTools (rare — usually only when the workspace has no
- * connected integrations) the server contains just the management tools.
+ * If sim sends more integration tools than MAX_INTEGRATION_TOOLS, we keep priority
+ * tools (gmail/calendar/slack/etc.) first and drop the long tail. Without this cap,
+ * 2500+ tool defs blow past Claude's prompt size limit and the chat fails with
+ * "Prompt is too long".
  */
 export async function buildSimMcpServer(integrationTools: IntegrationToolDef[] = []) {
   const managementTools = await getCachedManagementTools()
-  const integrationToolsByName = new Map<string, IntegrationToolDef>()
+  const managementNames = new Set(managementTools.map((m) => m.name))
+
+  // Dedupe by name + drop collisions with management tools (management wins).
+  const dedupedIntegrations = new Map<string, IntegrationToolDef>()
   for (const it of integrationTools) {
     if (!it?.name) continue
-    // Avoid name collisions with management tools — management wins (it's well-tested).
-    if (managementTools.some((m) => m.name === it.name)) continue
-    integrationToolsByName.set(it.name, it)
+    if (managementNames.has(it.name)) continue
+    if (dedupedIntegrations.has(it.name)) continue
+    dedupedIntegrations.set(it.name, it)
   }
+  const allIntegrations = Array.from(dedupedIntegrations.values())
+  const totalReceived = allIntegrations.length
+
+  // Sort by priority, then alphabetical, then take the top N.
+  allIntegrations.sort((a, b) => {
+    const pa = integrationPriority(a.name)
+    const pb = integrationPriority(b.name)
+    if (pa !== pb) return pa - pb
+    return a.name.localeCompare(b.name)
+  })
+  const keptIntegrations = allIntegrations.slice(0, MAX_INTEGRATION_TOOLS)
+  const droppedCount = totalReceived - keptIntegrations.length
 
   const sdkTools = [
     ...managementTools.map(buildToolFromMcp),
-    ...Array.from(integrationToolsByName.values()).map(buildToolFromIntegration),
+    ...keptIntegrations.map(buildToolFromIntegration),
   ]
 
   logger.info('built sim mcp server for request', {
     managementCount: managementTools.length,
-    integrationCount: integrationToolsByName.size,
-    integrationNames: Array.from(integrationToolsByName.keys()),
+    integrationCountKept: keptIntegrations.length,
+    integrationCountReceived: totalReceived,
+    integrationCountDropped: droppedCount,
+    cap: MAX_INTEGRATION_TOOLS,
+    sampleIntegrationNames: keptIntegrations.slice(0, 20).map((t) => t.name),
   })
 
   return createSdkMcpServer({
